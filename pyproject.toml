@@ -20,8 +20,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/<your-handle>/sakenowa-mcp"
-Repository = "https://github.com/<your-handle>/sakenowa-mcp"
+Homepage = "https://github.com/mame0001/sakenowa-mcp"
+Repository = "https://github.com/mame0001/sakenowa-mcp"
 "Data Source" = "https://sakenowa.com/"
 
 [project.scripts]

@@ -46,7 +46,7 @@ Plus a `recommend_sake` MCP **prompt** as a friendly entry point.
 Requires [uv](https://docs.astral.sh/uv/). Python is provisioned automatically (3.10+).
 
 ```bash
-git clone https://github.com/<your-handle>/sakenowa-mcp.git
+git clone https://github.com/mame0001/sakenowa-mcp.git
 cd sakenowa-mcp
 uv sync          # create venv + install
 uv run pytest    # run offline tests
