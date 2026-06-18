@@ -86,6 +86,8 @@ def compute_medians(flavors: Iterable[dict]) -> dict:
         a, b = axis_scores(f)
         aromas.append(a)
         bodies.append(b)
+    if not aromas:  # no rated sake -> neutral midpoint, never crash
+        return {"aroma": 0.0, "body": 0.0}
     return {"aroma": median(aromas), "body": median(bodies)}
 
 

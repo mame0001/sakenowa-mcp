@@ -45,3 +45,16 @@ def test_top_tags_count():
     f = {"f1": 0.9, "f2": 0.1, "f3": 0.8, "f4": 0.2, "f5": 0.7, "f6": 0.3}
     assert len(flavor.top_tags(f, 3)) == 3
     assert flavor.top_tags(f, 1)[0].startswith("華やか")
+
+
+def test_compute_medians_empty_does_not_crash():
+    assert flavor.compute_medians([]) == {"aroma": 0.0, "body": 0.0}
+
+
+def test_single_char_query_skips_fuzzy():
+    # 'z' is absent from 'ab' and is only 1 char -> fuzzy disabled -> no match
+    assert search._score("z", "ab", "") == 0
+
+
+def test_two_char_query_allows_fuzzy():
+    assert search._score("abx", "abc", "") > 0

@@ -35,14 +35,18 @@ def _ds():
     return data.get_dataset()
 
 
+def _clamp_int(value, lo: int, hi: int, default: int) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(v, hi))
+
+
 def _brand_line(b) -> str:
     flag = "✓flavor" if b.flavor else "—"
     rank = f" · #{b.overall_rank} overall" if b.overall_rank else ""
     return f"- **{b.name}** (id `{b.id}`) — {b.brewery} / {b.area} · {flag}{rank}"
-
-
-def _medians(ds):
-    return flavor.compute_medians([b.flavor for b in ds.flavored])
 
 
 # --------------------------------------------------------------------------- #
@@ -64,9 +68,10 @@ def sync_sakenowa_data(force: bool = False) -> str:
     flavored = len(ds.flavored)
     total_brands = len(ds.brands)
     pct = (100 * flavored / total_brands) if total_brands else 0
+    stale = " ⚠️ stale (refresh failed; serving cached snapshot)" if ds.meta.get("stale") else ""
     return (
         f"# Sakenowa dataset synced\n"
-        f"- Snapshot (year-month): **{ds.meta.get('year_month')}**\n"
+        f"- Snapshot (year-month): **{ds.meta.get('year_month')}**{stale}\n"
         f"- Fetched: {ds.meta.get('fetched_at_iso')}\n"
         f"- Breweries: **{c.get('breweries', 0):,}**\n"
         f"- Brands (sake): **{total_brands:,}**\n"
@@ -90,6 +95,7 @@ def search_sake(query: str, limit: int = 10, area: str = "") -> str:
     get_sake_profile / find_similar_sake / compare_sake.
     """
     ds = _ds()
+    limit = _clamp_int(limit, 1, 20, 10)
     hits = search.search(ds, query, limit=limit, area=area)
     if not hits:
         tip = f" in area '{area}'" if area else ""
@@ -127,7 +133,7 @@ def get_sake_profile(brand_id: int) -> str:
         lines.append(f"\n_{ATTR}_")
         return "\n".join(lines)
 
-    kanji, romaji, gloss = flavor.estimate_type(b.flavor, _medians(ds))
+    kanji, romaji, gloss = flavor.estimate_type(b.flavor, ds.medians)
     lines += [
         "",
         "## Flavor chart (0–1)",
@@ -174,6 +180,7 @@ def find_similar_sake(brand_id: int, mode: str = "similar", limit: int = 5) -> s
                 f"matched. Pick a sake whose profile shows ✓flavor.")
     if mode not in flavor.MODES:
         return f"Unknown mode '{mode}'. Choose one of: {', '.join(flavor.MODES)}."
+    limit = _clamp_int(limit, 1, 10, 5)
 
     base = flavor.vec(b.flavor)
     target = flavor.contrast_vec(base) if mode == "contrast" else flavor.shift(base, mode)
@@ -187,17 +194,32 @@ def find_similar_sake(brand_id: int, mode: str = "similar", limit: int = 5) -> s
         key=lambda t: t[0],
     )[:limit]
 
-    verb = "Most contrasting" if mode == "contrast" else f"Closest ({mode})"
+    if mode == "contrast":
+        verb, metric, note = (
+            "Most contrasting", "opposite-fit",
+            "_Ranked by closeness to the mirrored (opposite) flavor target._",
+        )
+    elif mode == "similar":
+        verb, metric, note = "Closest (similar)", "match", ""
+    else:
+        verb, metric, note = (
+            f"Closest ({mode})", "fit",
+            f"_Ranked by closeness to a '{mode}'-shifted target; the direction is "
+            f"approximate and may be weak where the data is sparse._",
+        )
+
     lines = [
         f"# {verb} to **{b.name}** ({b.brewery} / {b.area})",
         f"_base: {', '.join(flavor.top_tags(b.flavor))}_",
-        "",
     ]
+    if note:
+        lines.append(note)
+    lines.append("")
     for dist, o in ranked:
-        sim = max(0.0, 1 - dist / (6 ** 0.5))  # rough 0..1 similarity
+        sim = max(0.0, 1 - dist / (6 ** 0.5))  # rough 0..1 closeness to target
         lines.append(
             f"- **{o.name}** (id `{o.id}`) — {o.brewery} / {o.area} · "
-            f"match {sim:.0%} · {', '.join(flavor.top_tags(o.flavor))}"
+            f"{metric} {sim:.0%} · {', '.join(flavor.top_tags(o.flavor))}"
         )
     lines.append(f"\n_{ATTR}_")
     return "\n".join(lines)
@@ -212,8 +234,11 @@ def compare_sake(brand_ids: list[int]) -> str:
     spread (max−min) per axis to highlight where they differ most.
     """
     ds = _ds()
-    ids = [int(x) for x in brand_ids][:5]
-    if len(ids) < 2:
+    try:
+        ids = [int(x) for x in brand_ids]
+    except (TypeError, ValueError):
+        return "brand_ids must be a list of integer ids (use search_sake to find them)."
+    if not 2 <= len(ids) <= 5:
         return "Give 2–5 brand ids to compare (use search_sake to find them)."
 
     chosen = []
@@ -249,7 +274,9 @@ def recommend_sake(taste: str = "") -> str:
     return (
         "You are a sake sommelier with the `sakenowa` tools. "
         f"The drinker wants: {taste or '(ask them what they like)'}.\n"
-        "1. Use search_sake to anchor on a known bottle (or a style).\n"
+        "1. Use search_sake to anchor on a specific sake the drinker names. If "
+        "they describe only a taste/mood with no bottle, ask them to name one "
+        "sake they've enjoyed — there is no style-only search.\n"
         "2. Use find_similar_sake with an appropriate mode to expand options.\n"
         "3. Present 3 picks with their flavor tags and why they fit. "
         "Never invent polishing ratio, SMV, ABV or price — they aren't in the data."

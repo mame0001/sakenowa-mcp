@@ -28,9 +28,12 @@ def _score(query: str, name: str, brewery: str) -> int:
         return 60
     if brewery and query in brewery:
         return 45
-    ratio = SequenceMatcher(None, query, name).ratio()
-    if ratio >= 0.6:
-        return int(ratio * 40)
+    # Fuzzy fallback only for 2+ char queries; a single CJK char fuzz-matches
+    # far too many unrelated names.
+    if len(query) >= 2:
+        ratio = SequenceMatcher(None, query, name).ratio()
+        if ratio >= 0.6:
+            return int(ratio * 40)
     return 0
 
 
