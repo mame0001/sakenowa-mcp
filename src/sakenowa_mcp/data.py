@@ -39,6 +39,10 @@ _LIST_KEY = {
     "flavor_charts": "flavorCharts",
 }
 
+# Pre-snapshot on-disk format: one JSON file per endpoint at the cache root.
+# The current code neither reads nor writes these; _prune_cache removes them.
+_LEGACY_FILES = {f"{name}.json" for name in ENDPOINTS}
+
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600  # data updates ~monthly; refresh weekly
 FLAVOR_KEYS = ("f1", "f2", "f3", "f4", "f5", "f6")
 
@@ -101,6 +105,28 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _prune_cache(cdir: Path, keep: str) -> None:
+    """Garbage-collect the cache directory after a successful refresh, keeping
+    only the snapshot meta.json now points to. Removes superseded ``snapshot-*``
+    dirs, ``.staging-*`` leftovers from killed refreshes, and the pre-snapshot
+    multi-file format. Best-effort: pruning never raises, so it can't turn an
+    otherwise-successful refresh into a failure."""
+    import shutil
+
+    for child in cdir.iterdir():
+        name = child.name
+        try:
+            if child.is_dir():
+                if name.startswith(".staging-") or (
+                    name.startswith("snapshot-") and name != keep
+                ):
+                    shutil.rmtree(child, ignore_errors=True)
+            elif name in _LEGACY_FILES:
+                child.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def refresh() -> dict:
     """Fetch every endpoint, validate it, then commit the whole snapshot to the
     cache atomically (single file). Raises before touching the cache if any fetch
@@ -125,9 +151,12 @@ def refresh() -> dict:
             counts[name] = len(payload.get(_LIST_KEY[name], []))
 
     # Phase 2: write single snapshot file to unique temp directory.
-    # tempfile.mkdtemp() prevents cross-process collision of .tmp dirs.
+    # tempfile.mkdtemp() prevents cross-process collision of .tmp dirs. The
+    # ".staging-" prefix keeps it distinct from committed "snapshot-*" dirs so a
+    # leftover from a killed process is never mistaken for a real snapshot and
+    # can be pruned safely.
     fetched_at = time.time()
-    temp_dir = Path(tempfile.mkdtemp(dir=cdir, prefix="snapshot-"))
+    temp_dir = Path(tempfile.mkdtemp(dir=cdir, prefix=".staging-"))
     try:
         # Single snapshot JSON includes all endpoints + metadata.
         snapshot = {
@@ -162,6 +191,12 @@ def refresh() -> dict:
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         os.replace(meta_tmp, cdir / "meta.json")
+
+        # Now that meta.json points at the new snapshot, drop everything it no
+        # longer references: superseded snapshot dirs, staging leftovers from
+        # killed runs, and pre-snapshot legacy files. Best-effort; a pruning
+        # error never fails an otherwise-successful refresh.
+        _prune_cache(cdir, keep=final_snapshot_dir.name)
     except Exception:
         # Cleanup the staging dir if anything failed.
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -256,7 +291,7 @@ def build() -> Dataset:
         rankings_raw = payloads["rankings"]
         # Meta from snapshot (includes all counts, attribution, fetch timestamp).
         meta = {k: v for k, v in snapshot.items() if k != "payloads"}
-    except (KeyError, FileNotFoundError, json.JSONDecodeError, TypeError, AttributeError) as e:
+    except (ValueError, KeyError, FileNotFoundError, json.JSONDecodeError, TypeError, AttributeError) as e:
         raise ValueError(f"Corrupted cached data cannot be parsed: {e}") from e
 
     areas = {a["id"]: a["name"] for a in areas_raw if isinstance(a, dict) and "id" in a and "name" in a}
@@ -357,8 +392,10 @@ def get_dataset() -> Dataset:
              now - _LAST_REFRESH_ATTEMPT > _REFRESH_BACKOFF_SECONDS)
         )
 
+        refreshed = False
         if should_attempt_refresh:
             _LAST_REFRESH_ATTEMPT = now
+            refreshed = True
             try:
                 refresh()
             except Exception as exc:  # network / HTTP / validation error
@@ -369,7 +406,18 @@ def get_dataset() -> Dataset:
                     ) from exc
                 # Otherwise: fall through and serve the existing (stale) cache.
 
-        _DATASET = build()
+        try:
+            _DATASET = build()
+        except ValueError:
+            # The cache exists but can't be read — e.g. a pre-snapshot on-disk
+            # format whose timestamp still looked fresh, so the refresh above was
+            # skipped. Treat it as unusable: refetch once and rebuild. Guard
+            # against looping if we already refreshed on this call.
+            if refreshed:
+                raise
+            _LAST_REFRESH_ATTEMPT = now
+            refresh()
+            _DATASET = build()
         return _DATASET
 
 
