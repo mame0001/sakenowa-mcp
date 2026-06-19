@@ -103,8 +103,11 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def refresh() -> dict:
     """Fetch every endpoint, validate it, then commit the whole snapshot to the
-    cache atomically. Raises before touching the cache if any fetch fails, so a
-    mid-refresh network error leaves the previous snapshot intact."""
+    cache atomically (single file). Raises before touching the cache if any fetch
+    fails, so a mid-refresh network error leaves the previous snapshot intact."""
+    import shutil
+    import tempfile
+
     cdir = cache_dir()
     payloads: dict[str, Any] = {}
     counts: dict[str, int] = {}
@@ -121,47 +124,64 @@ def refresh() -> dict:
         else:
             counts[name] = len(payload.get(_LIST_KEY[name], []))
 
-    # Phase 2: write to temp directory, then atomically replace cache.
-    # This ensures a crash mid-refresh doesn't leave mixed old/new files.
-    import shutil
-    temp_dir = cdir / ".tmp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    # Phase 2: write single snapshot file to unique temp directory.
+    # tempfile.mkdtemp() prevents cross-process collision of .tmp dirs.
+    fetched_at = time.time()
+    temp_dir = Path(tempfile.mkdtemp(dir=cdir, prefix="snapshot-"))
     try:
-        for name, payload in payloads.items():
-            (temp_dir / f"{name}.json").write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-            )
+        # Single snapshot JSON includes all endpoints + metadata.
+        snapshot = {
+            "fetched_at": fetched_at,
+            "fetched_at_iso": _iso(fetched_at),
+            "year_month": year_month,
+            "counts": counts,
+            "attribution": ATTRIBUTION,
+            "payloads": payloads,  # All 5 endpoints in one file
+        }
+        snapshot_path = temp_dir / "snapshot.json"
+        snapshot_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False), encoding="utf-8"
+        )
+
+        # Phase 3: atomic commit (single os.replace).
+        # Move temp dir to finalized name, replacing any old snapshot dir.
+        final_snapshot_dir = cdir / f"snapshot-{int(fetched_at)}"
+        os.replace(temp_dir, final_snapshot_dir)
+
+        # Update pointer (meta.json) atomically to reference the new snapshot.
         meta = {
-            "fetched_at": time.time(),
-            "fetched_at_iso": _iso(time.time()),
+            "snapshot_dir": f"snapshot-{int(fetched_at)}",
+            "fetched_at": fetched_at,
+            "fetched_at_iso": _iso(fetched_at),
             "year_month": year_month,
             "counts": counts,
             "attribution": ATTRIBUTION,
         }
-        (temp_dir / "meta.json").write_text(
+        meta_tmp = cdir / "meta.json.tmp"
+        meta_tmp.write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        # Atomically commit: replace each file and meta last.
-        for name in payloads:
-            os.replace(temp_dir / f"{name}.json", cdir / f"{name}.json")
-        os.replace(temp_dir / "meta.json", cdir / "meta.json")
-    finally:
+        os.replace(meta_tmp, cdir / "meta.json")
+    except Exception:
+        # Cleanup the staging dir if anything failed.
         shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
     return meta
 
 
 def _cache_complete() -> bool:
-    """True only if every endpoint file plus meta.json exists and parses."""
-    cdir = cache_dir()
-    for name in list(ENDPOINTS) + ["meta"]:
-        path = cdir / f"{name}.json"
-        if not path.exists():
-            return False
-        try:
-            json.loads(path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            return False
-    return True
+    """True only if meta.json points to a valid snapshot.json with all endpoints."""
+    try:
+        snapshot = _get_snapshot()
+        # Validate snapshot schema: must have payloads with all 5 endpoints.
+        payloads = snapshot.get("payloads", {})
+        for name in ENDPOINTS:
+            if name not in payloads:
+                return False
+            _validate_payload(name, payloads[name])
+        return True
+    except (FileNotFoundError, ValueError, json.JSONDecodeError, KeyError):
+        return False
 
 
 def _cache_age() -> Optional[float]:
@@ -175,8 +195,19 @@ def _cache_age() -> Optional[float]:
         return None
 
 
-def _read(name: str) -> Any:
-    return json.loads((cache_dir() / f"{name}.json").read_text(encoding="utf-8"))
+def _get_snapshot() -> dict:
+    """Load the current snapshot from the pointer in meta.json."""
+    meta_path = cache_dir() / "meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError("meta.json not found")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    snapshot_dir_name = meta.get("snapshot_dir")
+    if not snapshot_dir_name:
+        raise ValueError("meta.json missing snapshot_dir pointer")
+    snapshot_path = cache_dir() / snapshot_dir_name / "snapshot.json"
+    if not snapshot_path.exists():
+        raise FileNotFoundError(f"snapshot at {snapshot_path} not found")
+    return json.loads(snapshot_path.read_text(encoding="utf-8"))
 
 
 # --------------------------------------------------------------------------- #
@@ -214,22 +245,28 @@ class Dataset:
 
 
 def build() -> Dataset:
+    """Build in-memory dataset from a single consistent snapshot (not multiple files)."""
     try:
-        areas_raw = _read("areas")["areas"]
-        breweries_raw = _read("breweries")["breweries"]
-        brands_raw = _read("brands")["brands"]
-        flavor_raw = _read("flavor_charts")["flavorCharts"]
-        rankings_raw = _read("rankings")
-        meta = json.loads((cache_dir() / "meta.json").read_text(encoding="utf-8"))
-    except (KeyError, FileNotFoundError, json.JSONDecodeError) as e:
+        snapshot = _get_snapshot()
+        payloads = snapshot.get("payloads", {})
+        areas_raw = payloads["areas"]["areas"]
+        breweries_raw = payloads["breweries"]["breweries"]
+        brands_raw = payloads["brands"]["brands"]
+        flavor_raw = payloads["flavor_charts"]["flavorCharts"]
+        rankings_raw = payloads["rankings"]
+        # Meta from snapshot (includes all counts, attribution, fetch timestamp).
+        meta = {k: v for k, v in snapshot.items() if k != "payloads"}
+    except (KeyError, FileNotFoundError, json.JSONDecodeError, TypeError, AttributeError) as e:
         raise ValueError(f"Corrupted cached data cannot be parsed: {e}") from e
 
-    areas = {a["id"]: a["name"] for a in areas_raw if "id" in a and "name" in a}
-    breweries = {b["id"]: b for b in breweries_raw if "id" in b}
+    areas = {a["id"]: a["name"] for a in areas_raw if isinstance(a, dict) and "id" in a and "name" in a}
+    breweries = {b["id"]: b for b in breweries_raw if isinstance(b, dict) and "id" in b}
 
     # Flavor rows: coerce to float, keep only complete vectors in [0, 1].
     flavor: dict[int, dict] = {}
     for f in flavor_raw:
+        if not isinstance(f, dict):
+            continue
         bid = f.get("brandId")
         if bid is None:
             continue
@@ -242,16 +279,20 @@ def build() -> Dataset:
 
     overall_rank: dict[int, int] = {}
     for row in rankings_raw.get("overall", []):
-        if "brandId" in row and "rank" in row:
+        if isinstance(row, dict) and "brandId" in row and "rank" in row:
             overall_rank[row["brandId"]] = row["rank"]
     area_rank: dict[int, int] = {}
     for group in rankings_raw.get("areas", []):
+        if not isinstance(group, dict):
+            continue
         for row in group.get("ranking", []):
-            if "brandId" in row and "rank" in row:
+            if isinstance(row, dict) and "brandId" in row and "rank" in row:
                 area_rank.setdefault(row["brandId"], row["rank"])
 
     brands: dict[int, Brand] = {}
     for br in brands_raw:
+        if not isinstance(br, dict):
+            continue
         bid = br.get("id")
         if bid is None:
             continue
@@ -283,23 +324,41 @@ def build() -> Dataset:
 # --------------------------------------------------------------------------- #
 _DATASET: Optional[Dataset] = None
 _LOCK = threading.RLock()
+_LAST_REFRESH_ATTEMPT: Optional[float] = None
+_REFRESH_BACKOFF_SECONDS = 300  # Don't retry network for 5 min after failure
 
 
 def get_dataset() -> Dataset:
     """Return the in-memory dataset, fetching/refreshing the cache if missing or
     older than the TTL. Thread-safe. If a refresh is due but the network is
     unavailable, an existing (stale) cache is served rather than failing; only a
-    truly empty/corrupt cache raises."""
-    global _DATASET
+    truly empty/corrupt cache raises. Backoff prevents hammering the network
+    when it is unavailable."""
+    global _DATASET, _LAST_REFRESH_ATTEMPT
     with _LOCK:
         age = _cache_age()
+        now = time.time()
+
         # If cache is stale or missing, clear the in-memory dataset to force refresh.
         if age is None or age > _ttl():
             _DATASET = None
+
+        # If we have a recent valid dataset in memory, return it without network.
         if _DATASET is not None:
             return _DATASET
-        # Need to refresh or build.
-        if age is None or age > _ttl():
+
+        # Decide whether to attempt a network refresh.
+        # Only retry network if:
+        #   1. Cache is missing or stale, AND
+        #   2. We haven't tried recently (backoff to avoid hammering network)
+        should_attempt_refresh = (
+            (age is None or age > _ttl()) and
+            (_LAST_REFRESH_ATTEMPT is None or
+             now - _LAST_REFRESH_ATTEMPT > _REFRESH_BACKOFF_SECONDS)
+        )
+
+        if should_attempt_refresh:
+            _LAST_REFRESH_ATTEMPT = now
             try:
                 refresh()
             except Exception as exc:  # network / HTTP / validation error
@@ -309,12 +368,15 @@ def get_dataset() -> Dataset:
                         f"exists. Check your network and retry. ({exc})"
                     ) from exc
                 # Otherwise: fall through and serve the existing (stale) cache.
+
         _DATASET = build()
         return _DATASET
 
 
 def reset_cache() -> None:
-    """Drop the in-process dataset so the next get_dataset() rebuilds it."""
-    global _DATASET
+    """Drop the in-process dataset so the next get_dataset() rebuilds it.
+    Also reset the refresh attempt timer to allow immediate retry."""
+    global _DATASET, _LAST_REFRESH_ATTEMPT
     with _LOCK:
         _DATASET = None
+        _LAST_REFRESH_ATTEMPT = None

@@ -43,6 +43,11 @@ def _clamp_int(value, lo: int, hi: int, default: int) -> int:
     return max(lo, min(v, hi))
 
 
+def _escape_markdown_table_cell(s: str) -> str:
+    """Escape special markdown table characters to prevent table corruption."""
+    return s.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
 def _brand_line(b) -> str:
     flag = "✓flavor" if b.flavor else "—"
     rank = f" · #{b.overall_rank} overall" if b.overall_rank else ""
@@ -235,6 +240,8 @@ def compare_sake(brand_ids: list[int]) -> str:
     spread (max−min) per axis to highlight where they differ most.
     """
     ds = _ds()
+    if not isinstance(brand_ids, (list, tuple)):
+        return "brand_ids must be a list of integer ids (use search_sake to find them)."
     try:
         ids = [int(x) for x in brand_ids]
     except (TypeError, ValueError):
@@ -251,7 +258,9 @@ def compare_sake(brand_ids: list[int]) -> str:
             return f"'{b.name}' (id {i}) has no flavor chart, so it can't be compared."
         chosen.append(b)
 
-    header = "| axis | " + " | ".join(f"{b.name}" for b in chosen) + " | spread |"
+    # Escape brand names in table to prevent markdown corruption from pipes/newlines.
+    escaped_names = [_escape_markdown_table_cell(b.name) for b in chosen]
+    header = "| axis | " + " | ".join(escaped_names) + " | spread |"
     sep = "|" + "---|" * (len(chosen) + 2)
     rows = [header, sep]
     for k, jp, en in flavor.AXES:
@@ -261,7 +270,7 @@ def compare_sake(brand_ids: list[int]) -> str:
         rows.append(f"| {jp} {en} | {cells} | {spread:.2f} |")
 
     note = "\n".join(
-        f"- **{b.name}**: {', '.join(flavor.top_tags(b.flavor))}" for b in chosen
+        f"- **{_escape_markdown_table_cell(b.name)}**: {', '.join(flavor.top_tags(b.flavor))}" for b in chosen
     )
     return f"# Comparing {len(chosen)} sake\n" + "\n".join(rows) + "\n\n" + note + f"\n\n_{ATTR}_"
 
