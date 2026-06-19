@@ -83,10 +83,14 @@ def _validate_payload(name: str, payload: Any) -> None:
     if name == "rankings":
         if not isinstance(payload.get("overall"), list):
             raise ValueError("rankings payload missing 'overall' list")
+        if len(payload.get("overall", [])) == 0:
+            raise ValueError("rankings payload 'overall' list is empty")
     else:
         key = _LIST_KEY[name]
         if not isinstance(payload.get(key), list):
             raise ValueError(f"/{ENDPOINTS[name]} payload missing '{key}' list")
+        if len(payload.get(key, [])) == 0:
+            raise ValueError(f"/{ENDPOINTS[name]} payload '{key}' list is empty")
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -117,18 +121,32 @@ def refresh() -> dict:
         else:
             counts[name] = len(payload.get(_LIST_KEY[name], []))
 
-    # Phase 2: commit. Data files first, then meta.json last as the marker that
-    # a complete, consistent snapshot is on disk.
-    for name, payload in payloads.items():
-        _atomic_write(cdir / f"{name}.json", json.dumps(payload, ensure_ascii=False))
-    meta = {
-        "fetched_at": time.time(),
-        "fetched_at_iso": _iso(time.time()),
-        "year_month": year_month,
-        "counts": counts,
-        "attribution": ATTRIBUTION,
-    }
-    _atomic_write(cdir / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+    # Phase 2: write to temp directory, then atomically replace cache.
+    # This ensures a crash mid-refresh doesn't leave mixed old/new files.
+    import shutil
+    temp_dir = cdir / ".tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for name, payload in payloads.items():
+            (temp_dir / f"{name}.json").write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+        meta = {
+            "fetched_at": time.time(),
+            "fetched_at_iso": _iso(time.time()),
+            "year_month": year_month,
+            "counts": counts,
+            "attribution": ATTRIBUTION,
+        }
+        (temp_dir / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        # Atomically commit: replace each file and meta last.
+        for name in payloads:
+            os.replace(temp_dir / f"{name}.json", cdir / f"{name}.json")
+        os.replace(temp_dir / "meta.json", cdir / "meta.json")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
     return meta
 
 
@@ -196,14 +214,17 @@ class Dataset:
 
 
 def build() -> Dataset:
-    areas_raw = _read("areas")["areas"]
-    breweries_raw = _read("breweries")["breweries"]
-    brands_raw = _read("brands")["brands"]
-    flavor_raw = _read("flavor_charts")["flavorCharts"]
-    rankings_raw = _read("rankings")
-    meta = json.loads((cache_dir() / "meta.json").read_text(encoding="utf-8"))
+    try:
+        areas_raw = _read("areas")["areas"]
+        breweries_raw = _read("breweries")["breweries"]
+        brands_raw = _read("brands")["brands"]
+        flavor_raw = _read("flavor_charts")["flavorCharts"]
+        rankings_raw = _read("rankings")
+        meta = json.loads((cache_dir() / "meta.json").read_text(encoding="utf-8"))
+    except (KeyError, FileNotFoundError, json.JSONDecodeError) as e:
+        raise ValueError(f"Corrupted cached data cannot be parsed: {e}") from e
 
-    areas = {a["id"]: a["name"] for a in areas_raw if "id" in a}
+    areas = {a["id"]: a["name"] for a in areas_raw if "id" in a and "name" in a}
     breweries = {b["id"]: b for b in breweries_raw if "id" in b}
 
     # Flavor rows: coerce to float, keep only complete vectors in [0, 1].
@@ -271,9 +292,13 @@ def get_dataset() -> Dataset:
     truly empty/corrupt cache raises."""
     global _DATASET
     with _LOCK:
+        age = _cache_age()
+        # If cache is stale or missing, clear the in-memory dataset to force refresh.
+        if age is None or age > _ttl():
+            _DATASET = None
         if _DATASET is not None:
             return _DATASET
-        age = _cache_age()
+        # Need to refresh or build.
         if age is None or age > _ttl():
             try:
                 refresh()

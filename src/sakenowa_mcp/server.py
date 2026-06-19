@@ -61,8 +61,9 @@ def sync_sakenowa_data(force: bool = False) -> str:
     Returns dataset counts, the data's year-month, and the required attribution.
     """
     if force:
-        data.refresh()
-        data.reset_cache()
+        with data._LOCK:
+            data.refresh()
+            data.reset_cache()
     ds = _ds()
     c = ds.meta.get("counts", {})
     flavored = len(ds.flavored)
